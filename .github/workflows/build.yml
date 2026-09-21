@@ -8,11 +8,9 @@ on:
         type: choice
         options:
           - debug
-          - test
-          - release
         default: debug
     branches:
-      - 'sixteen'
+      - 'seventeen'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -25,7 +23,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [c2s, c1s, x1s, y2slte, y2s, z3s, r8s]
+        target: [c1s]
 
     steps:
       - name: Checkout repo
