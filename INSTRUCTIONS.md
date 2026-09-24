@@ -63,6 +63,10 @@ Validation performed after adding the script:
 3. Confirmed that `y2s-logcat` remains attached while the device is connected
    and that its log contains `DEVICE_CONNECTED_2026-09-16_16:49:21-0300`.
 
+The `y2s-logcat` session was reopened on 2026-09-23 at 17:50:14 (-0300)
+using the same persistent script. It is currently waiting for ADB to report a
+connected device; no capture directory is created until the next connection.
+
 ## Logs inspected
 
 The latest active capture is:
@@ -92,6 +96,28 @@ The previous graphics fixes are working in this boot cycle:
 Do not revert the legacy mapper or ION SELinux fixes while investigating the current failure.
 
 ## Current fatal boot failure
+
+### 2026-09-22 bootloop: invalid USB timeout patch
+
+The boot diagnostics from `out/target/y2s/boot-diagnostics-2026-09-22_22:52:08-0300/logcat.txt`
+showed `system_server` aborting repeatedly with:
+
+```text
+java.lang.VerifyError: Verifier rejected class
+com.android.server.power.PowerManagerService:
+updateIsPoweredLocked(int): register v2 has type PositiveByteConstant but expected Long
+```
+
+`bootchecker` then issued `reboot,rescueparty_by_bootchecker R5`. The cause was
+`platform/exynos990/patches/framework_compat/smali/system/framework/services.jar/0002-avoid-resetting-screen-timeout-on-power-plug.patch`:
+its injected USB check overwrote `v2`, the low half of the live `long v2/v3`
+timestamp passed to `wakePowerGroupLocked()` and `userActivityNoUpdateLocked()`.
+The patch was first corrected to use the dead integer temporaries `v4` and
+`v6`, but adding a fifteenth local remapped `p1` to `v16` and caused another
+smali failure. The final version keeps `.locals 14` and stores the old plug
+type in the no-longer-used `p1` register after its flag check. No build or
+flash has been run after this correction; rebuild `services.jar` before
+testing.
 
 The boot progresses into Android framework startup, but `system_server` dies with this verifier error:
 
@@ -2799,3 +2825,259 @@ As validações locais foram `bash -n` nos scripts alterados e `git diff --check
 Os módulos `unica/mods/appzygote_compat`, `zzzzz_zygote_next_trace` e
 `scripts/capture_logcat_tmux.sh` permanecem fora deste envio por serem
 diagnósticos/experimentais, não correções confirmadas.
+
+## ICDFix adaptado para One UI 9.0 (2026-09-22)
+
+O patch recebido em `/home/ats0c/Downloads/ICDFix_8.5/` foi comparado com o
+`services.jar` decodificado da base Android 17/One UI 9. A versão 8.5 removia
+os campos `mVerifiableIntegrity` de `AttestParameterSpec` e alterava a ABI das
+classes. Essa remoção não é segura na base 9.0, que ainda compartilha essas
+classes com `samsungkeystoreutils` no bootclasspath.
+
+O patch original foi adaptado em:
+
+```text
+unica/mods/knoxpatch/services.jar/0001-Bypass-ICD-verification.patch
+```
+
+A implementação original é de Devcore94; esta árvore contém a adaptação
+mantida por At30c para a ABI da One UI 9.0. A adaptação mantém os campos e a ABI da 9.0, remove os setters/reflexões que
+apenas forçavam o valor `false` em `DevicePolicyManagerService`,
+`DarManagerService`, `UserManagerService` e `SemSsdidManagerService`, e força
+o `AttestationUtils` de `services.jar` a não acrescentar o parâmetro KeyMint
+`0x700008fe` de verifiable integrity. O crédito original de Devcore94 foi
+mantido no cabeçalho do patch.
+
+Validações realizadas:
+
+1. `git apply --check` passou contra uma cópia limpa do `services.jar` 9.0.
+2. O `services.jar` reconstruído com Apktool 3.0.3-16 smaliou as duas dex e
+   foi empacotado sem erro.
+3. A remoção foi limitada aos callers identificados; os campos compartilhados
+   continuam presentes para evitar incompatibilidade de ABI.
+
+Este ajuste trata somente a construção da solicitação de atestação em
+userspace. Ele não altera o estado comprometido retornado pelo Keymaster/TEE;
+no log de 2026-09-22 o Secure Folder ainda recebeu `SECURE_HW_ACCESS_DENIED`
+(-45) em `KnoxTestKey`, portanto a eficácia no hardware precisa ser validada
+ com uma nova build instalada.
+
+## Teste do caminho Secure Folder/KnoxTestKey (2026-09-22)
+
+Foi adicionado `unica/mods/knoxpatch/services.jar/0002-Test-bypass-Knox-key-installability.patch`.
+Ele faz `DarManagerService.isKnoxKeyInstallable()` retornar `true` antes da
+tentativa de atestação de `KnoxTestKey`. O patch é somente diagnóstico: não
+modifica VaultKeeper, Keymaster, TEE ou chaves protegidas por hardware. Se o
+Secure Folder continuar falhando após essa etapa, a rejeição ocorre abaixo do
+framework e o log deve continuar mostrando `SECURE_HW_ACCESS_DENIED (-45)`.
+## VNDK v30 cgroup client repair (2026-09-22)
+
+The boot log from a clean checkout showed that vendor audio, DRM, Widevine,
+and OMX services could not link `libprocessgroup.so` because the isolated
+`com.android.vndk.v30` namespace did not contain `libcgrouprc.so`. The earlier
+cgroup modules only installed loose `/system/lib` and `/system/lib64` copies;
+that does not satisfy an APEX linker namespace.
+
+`unica/patches/vndk/customize.sh` now rebuilds the target VNDK v30 payload
+for the Exynos 990/API-30 target when either cgroup client is missing. It imports the target firmware's
+Android 33 libraries (both ARM32 and ARM64), validates that they export the
+required `LIBCGROUPRC_30` ABI, preserves the payload metadata, rebuilds and
+AVB-signs the APEX, and verifies that both libraries are present in the final
+`apex_payload.img`. The target libraries were selected instead of the newer
+Android 17 donor copies because `libprocessgroup.so` in this VNDK explicitly
+requires the v30 symbol version.
+
+The VNDK module still skips rebuilding when an incremental work directory
+already contains both payload libraries. A fresh/incremental build must run
+the VNDK module so the repaired APEX is included in the generated system_ext
+image.
+
+## USB power transition screen-timeout fix (2026-09-22)
+
+The connected device reported `stay_on_while_plugged_in=0` and
+`mStayOn=false`, but `PowerManagerService` still refreshed user activity after
+every charger/USB transition. That path can keep an already interactive screen
+on for another full timeout whenever the cable is connected. The device's power
+history confirmed the related `plugged_in` wake event.
+
+The framework compatibility patch
+`platform/exynos990/patches/framework_compat/smali/system/framework/services.jar/0002-avoid-resetting-screen-timeout-on-power-plug.patch`
+guards that `userActivityNoUpdateLocked()` call whenever the current or
+previous plug type is USB (`2`). This also covers a disconnect/reconnect
+oscillation; AC and wireless-only transitions retain their stock behavior. The normal
+`wakePowerGroupLocked()` path remains intact, so a device that is actually asleep
+can still wake for the charging UI; an already-awake display no longer receives
+an artificial timeout reset from a USB connection or its matching disconnect.
+This is an experimental fix
+and must be validated with a build installed on hardware.
+
+Validation performed: `git apply --check` passed against a clean decoded
+`services.jar`; the assembled smali keeps `.locals 14` and stores the previous
+plug type in `p1` (register `v15`), avoiding both the wide-register verifier
+failure and the `v16` register limit failure. A controlled device test with a 5-second timeout showed that a
+USB connection while awake still allowed the display to turn off after 5 s;
+the simulated disconnect path was also exercised. `git diff --check` reported
+no whitespace errors. After the first failed incremental build left a decoded
+tree with the obsolete `.locals 15`/`v14` variant, that generated tree was
+updated to the final patch as well, so the next incremental invocation can
+recognize it as already applied. No build or flash was run after this fix.
+
+## Charging UI waking a black display (2026-09-23)
+
+The boot diagnostic from 2026-09-23 showed that the USB/power transition patch
+was not the only wake path. `PowerUI.ChargingInfoExecutor` (SystemUI UID
+10047) explicitly called `PowerManager.wakeUp()` while displaying the
+incomplete-charger popup. Immediately afterward SurfaceFlinger powered the
+display on, while the panel still had no visible frame. The same call also
+exists for the slow-charger toast. This matches the symptom of a display that
+is electrically on but completely black and does not point to a normal
+screen-timeout reset.
+
+The new patch
+`platform/exynos990/patches/framework_compat/smali/system_ext/priv-app/SystemUI/SystemUI.apk/0001-prevent-charging-info-from-waking-black-display.patch`
+replaces both charging-info `PowerManager.wakeUp()` calls with `nop`. The
+charging popup/toast remains available; only the unsolicited display wake is
+suppressed so the normal display pipeline can decide when to turn the panel
+on. The framework patch remains separate because it handles a different
+`PowerManagerService` user-activity path.
+
+Validation performed: `git apply --check` passed against the clean decoded
+SystemUI.apk, and `git diff --check` reported no whitespace errors. No ROM
+build or flash was run after this change; hardware validation is still
+required. The first placement under `smali/system/system_ext` was not
+discovered by `apply_modules.sh`; the patch is now under the repository's
+correct `smali/system_ext` path, matching the existing SystemUI modules.
+
+## Make ROM log generation (2026-09-23)
+
+`buildenv.sh` writes `make_rom-YYYYMMDD_HHMMSS.log` through the `run_cmd`
+wrapper, exposed as `unica make_rom ...`. The `aether` alias intentionally
+executes `./scripts/make_rom.sh` directly and therefore does not create that
+log file; its output only appears in the terminal unless redirected manually.
+The last wrapper-generated log in this checkout is from 2026-09-21. Builds
+that updated `work_dir` on 2026-09-23 did not produce a newer `make_rom` log
+for this reason.
+
+To retain a build log, use:
+
+```bash
+source buildenv.sh y2s
+unica make_rom -c --no-rom-zip
+```
+
+The SystemUI charging patch must be checked in that new log by searching for
+`SystemUI: do not wake display for charging info overlays`.
+
+## Black panel after USB connection: doze-charging cause (2026-09-23)
+
+The installed SystemUI was verified by SHA-256 against `work_dir`, and its
+decoded smali contains the two `nop` instructions from the charging-info
+`wakeUp()` patch. The symptom therefore persisted with that patch genuinely
+installed.
+
+The reproduction at 03:47:33 identified the remaining path. With the display
+already OFF, USB insertion caused `AodTriggerController` to request a doze
+charging session. `DozeMachine` changed from `DOZE` to `DOZE_AOD`, the display
+changed from OFF to DOZE, and the Exynos HWC received an unblank request while
+`DisplayPowerController` reported brightness `0.0`/2 nits. This is the direct
+explanation for a physically powered panel with no visible image.
+
+`platform/exynos990/patches/framework_compat/smali/system_ext/priv-app/SystemUI/SystemUI.apk/0002-keep-charging-animation-in-legacy-doze.patch`
+initially made `AodTriggerExecutor.isDozeChargingCondition()` return false.
+Hardware testing confirmed that this stopped the black-panel symptom, but it
+also disabled the charging animation while the screen was off.
+
+The patch was refined after comparing the One UI 9 implementation with the
+stock S20+ SystemUI. The stock implementation starts the PluginAOD charging
+animation and holds its draw wakelock without forcibly promoting the panel out
+of DOZE through the new override API. The refined patch therefore leaves
+`isDozeChargingCondition()`, the doze session, animation and passive refresh
+rate token unchanged, and replaces the One UI 9
+`setDisplayStateOverride(..., Display.STATE_ON, 4500)` call with `nop`.
+
+Hardware testing showed that the animation returned, but the panel still
+remained active. The log then exposed the actual failed shutdown operation:
+after `AnimTimeout` and `DozeChargingSession.close`, the call to
+`PluginAODManager.chargingAnimStarted(false)` ran on `SystemUIBg-8`.
+`DozeMachine.requestState()` rejected it with `IllegalStateException: should
+be called from the main thread`, leaving the machine in `DOZE_AOD` after the
+animation disappeared.
+
+The final patch adds a small Runnable and posts `chargingAnimStarted(false)`
+to `PluginAODManager.mHandler`, which is constructed with
+`Looper.getMainLooper()`. This preserves the charging animation and allows
+DozeMachine to perform its normal exit transition when the animation timeout
+fires. The force-ON override remains disabled because the animation already
+renders through the DOZE_AOD path.
+
+`git apply --check` passed against the currently decoded SystemUI and
+`git diff --check` reported no whitespace errors. No ROM build or flash was
+run after this refined change. The existing decoded incremental tree was also
+aligned with the final variant: the original doze eligibility logic was
+restored, the force-ON call is `nop`, and the main-thread Runnable is present.
+A clean apply check and a reverse apply check against that tree both passed,
+so the build helper can recognize the final patch if it reuses the tree.
+
+## Charging/display fix confirmed and published (2026-09-23)
+
+The new build was tested on the S24+ target device and the USB charging
+scenario is now resolved: the display no longer remains active with a black
+panel, while the charging animation remains available and exits normally.
+The fix is published as three patches:
+
+1. `platform/exynos990/patches/framework_compat/smali/system/framework/services.jar/0002-avoid-resetting-screen-timeout-on-power-plug.patch`
+   prevents the USB plug/disconnect transition from refreshing the interactive
+   screen timeout.
+2. `platform/exynos990/patches/framework_compat/smali/system_ext/priv-app/SystemUI/SystemUI.apk/0001-prevent-charging-info-from-waking-black-display.patch`
+   removes the two unsolicited charging-info `PowerManager.wakeUp()` calls.
+3. `platform/exynos990/patches/framework_compat/smali/system_ext/priv-app/SystemUI/SystemUI.apk/0002-keep-charging-animation-in-legacy-doze.patch`
+   keeps the legacy DOZE charging animation, avoids the incompatible force-ON
+   display override, and posts the animation-close callback to the main
+   looper so `DozeMachine` can leave `DOZE_AOD` cleanly.
+
+Only these patches and this documentation entry are being committed. No ROM
+build or flash was executed while publishing them.
+
+## Source-firmware MIDAS stack (2026-09-23)
+
+The current Photo Remaster crash showed a mixed stack: the S24+ engine was
+loading the S21 `p3sxxx` PhotoRemaster APK and MIDAS libraries. The MIDAS
+module now unconditionally restores the source-firmware stack, preventing an
+environment override from selecting the incompatible S21 donor. It restores
+`vendor/etc/midas`, `vendor/etc/VslMesDetector`,
+`PhotoRemasterService.apk`, `libmidas_core.camera.samsung.so`, and
+`libmidas_DNNInterface.camera.samsung.so` from the configured S24+ source
+firmware. The change has only passed shell syntax/read-only checks; no build
+or flash was run.
+
+The first test with the coherent S24+ stack reached `AI_UPSCALE_4X`, but the
+S24+ `midas_config.json` selected its generic fallback because the device
+reports `ro.soc.model=Exynos 990`. That fallback requested the absent
+`SRIBMidas_aiUPSCALER_4X_LITE_V100_INT8.tflite`, after which the DNN cleanup
+triggered a Scudo misaligned-pointer abort. The MIDAS module now adds the
+existing Lite 2x/3x/4x model assets from the `p3sxxx` prebuilt and explicitly
+associates the fallback entry with `Exynos 990`; the Photo Remaster APK and
+MIDAS engine/core libraries remain from the S24+ source stack. This is a
+static configuration change only; no build or flash has been run.
+
+## HDR10+ Exynos 990 encoder compatibility (2026-09-24)
+
+The Android 17 source `libstagefright.so` aborted HDR10+ recording modes 10/25.
+The first workaround escaped after the compiler had reused `x19` for the
+`ACodec` log tag, corrupting the `ACodec *this` pointer. The platform camera
+module now redirects both fatal-block entries before that clobber and restores
+the experimental CFI/process-cache modifications in incremental work dirs.
+
+After that correction, `MediaRecorder::prepare()` failed with `-61`
+(`ENODATA`). Android 17 requested HEVC profile `0x2000`
+(`Main10HDR10Plus`), while the Android 11 Exynos 990 OMX encoder enumerates
+only Main (`1`), Main10 (`2`) and Main10HDR10 (`0x1000`). The camera module now
+uses the unreachable fatal block as a guarded trampoline that translates only
+`0x2000` to `0x1000` for legacy OMX verification/configuration; other HEVC
+profiles are unchanged.
+
+The resulting branch/trampoline bytes were verified by disassembly, and the
+script passed `bash -n` and `git diff --check`. The ROM was subsequently built,
+installed and tested by the maintainer: HDR10+ recording is functional and the
+`configureCodec returning error -61` failure is resolved. Preserve this patch
+while the Exynos 990 Android 11 OMX stack is paired with Android 17 Stagefright.
