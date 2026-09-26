@@ -19,5 +19,18 @@ do
     ADD_TO_WORK_DIR "p3sxxx" "vendor" "$blob"
 done
 
+# apply_modules.sh imports this module's whole vendor/ tree with
+# ADD_TO_WORK_DIR "<module>" "vendor" ".", so the canned file_context-vendor
+# next to this script is what labels the blobs it ships. Files the stock
+# firmware does not already label would otherwise get an empty context and
+# mkfs.erofs would refuse the vendor image with "line N is missing fields".
+INCOMPLETE_CONTEXTS="$(awk 'NF < 2 { print }' "$WORK_DIR/configs/file_context-vendor")"
+if [ -n "$INCOMPLETE_CONTEXTS" ]; then
+    LOGE "Incomplete file_context entries in /vendor: $INCOMPLETE_CONTEXTS"
+    return 1
+fi
+
 SET_PROP "vendor" "ro.vendor.uwb.feature.chipname" "sr100"
 LOG_STEP_OUT
+
+unset INCOMPLETE_CONTEXTS
